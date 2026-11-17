@@ -4,6 +4,8 @@ SuriQ AI helps construction procurement teams catch discrepancies before choosin
 
 ## Demo
 
+https://github.com/user-attachments/assets/fb4f5740-6321-43a4-ab11-ac8410146265
+
 In this demo, a supplier quotes 800 bags of cement against 850 required. SuriQ flags the shortfall and shows the line it came from.
 
 ## What reviewers can do
