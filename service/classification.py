@@ -1,0 +1,104 @@
+"""Classify procurement purpose from independently corroborated source evidence."""
+import re
+
+REQUIREMENTS = re.compile(r"^\s*(?:project\s+)?(?:bill of (?:materials|quantities)|bom|boq|material requirements)\b(?![-.]\d)", re.I)
+BOQ = re.compile(r"^\s*(?:project\s+)?(?:bill of quantities|boq)\b(?![-.]\d)", re.I)
+BUYER_SOURCE = re.compile(
+    r"^\s*(?:request for (?:quotation|quote)|rfq|(?:technical|project|purchase) specifications|"
+    r"(?:procurement |bid |project )?addendum)\b", re.I,
+)
+BASELINE_ROLES = {"bom", "boq"}
+OFFER = re.compile(r"^\s*(?:(?:supplier|price|sales)\s+)?(?:quotation|quote|price proposal|we (?:hereby |are pleased to )?offer)\b", re.I)
+UNSUPPORTED = re.compile(
+    r"^\s*(?:tax invoice|sales invoice|invoice(?!\s+(?:address|to|billing))|purchase order|"
+    r"material requisition|purchase requisition|purchase request|delivery receipt)\b", re.I
+)
+MODEL_OFFER = re.compile(
+    r"\b(?:validity of (?:this |our )?offer|we (?:hereby |are pleased to )?offer|offer (?:is )?valid|"
+    r"prices quoted|quotation (?:reference|validity))\b", re.I
+)
+OFFER_TERMS = {"supplier", "reference", "validity", "payment"}
+COMMERCIAL = OFFER_TERMS | {"tax", "freight", "vat", "discount"}
+
+
+def classify(snapshot):
+    headings = snapshot.get("headings", [])
+    requirements = [a for a in headings if REQUIREMENTS.search(a["text"])]
+    boq = [a for a in requirements if BOQ.search(a["text"])]
+    buyer = [a for a in headings if BUYER_SOURCE.search(a["text"])]
+    offers = [a for a in headings if OFFER.search(a["text"])]
+    unsupported = [a for a in headings if UNSUPPORTED.search(a["text"])]
+    terms = {field: a for field, a in snapshot["term_anchors"].items() if field in COMMERCIAL}
+    lines = snapshot["lines"]
+    summaries = [snapshot["term_anchors"][field] for field in ("materials_total", "total")
+                 if field in snapshot["term_anchors"] and (
+                     not snapshot["term_anchors"][field].get("weak")
+                     or snapshot["term_anchors"][field].get("method") == "model"
+                     and snapshot.get("provenance", {}).get("provider") in {"gemini", "meta"}
+                 )
+                 and re.fullmatch(r"(?:(?:[A-Z]{3}\.?|₱)\s*)?\d[\d,]*(?:\.\d+)?", snapshot["terms"].get(field, ""), re.I)]
+    prices = [row["anchors"][field] for row in lines for field in ("unit_price", "amount")
+              if row["fields"].get(field) and field in row["anchors"]]
+    quantities = [row["anchors"]["quantity"] for row in lines if row["fields"].get("quantity") and "quantity" in row["anchors"]]
+    evidence = requirements + offers + list(terms.values())
+    proposals = snapshot.get("model_classifications", [])
+    # Model votes only participate when their cited text contains an independent role signal.
+    proposed_bom = [anchor for item in proposals if item["role"] == "bom" for anchor in item["evidence"]
+                    if REQUIREMENTS.search(anchor["text"])]
+    proposed_offer = [anchor for item in proposals if item["role"] == "quote" for anchor in item["evidence"]
+                      if OFFER.search(anchor["text"]) or MODEL_OFFER.search(anchor["text"])]
+    native_offer_terms = {field for field in OFFER_TERMS & terms.keys() if terms[field].get("method") != "model"}
+    issued_boq = bool(boq and offers and (
+        any(source.get("offer_issuer") for source in snapshot.get("sources", []))
+        or "supplier" in native_offer_terms and bool(native_offer_terms & {"reference", "payment", "validity"})
+    ))
+    estimated = [a for a in headings if re.search(r"\bestimated (?:unit )?(?:cost|price)\b", a["text"], re.I)]
+    groups = {}
+    issuer = ""
+    for source in snapshot.get("sources", []):
+        if source.get("bundle_mark", {}).get("kind") in {"reference", "ambiguous"}:
+            issuer = ""
+            continue
+        issuer = source.get("offer_issuer") or issuer
+        if issuer:
+            group = groups.setdefault(" ".join(issuer.casefold().split()), {"supplier": issuer, "pages": []})
+            group["pages"].append(source["ref"])
+    bundled = list(groups.values()) if len(groups) > 1 else []
+    if unsupported:
+        role, basis, evidence = "unsupported", "Source identifies an unsupported procurement document.", unsupported
+    elif bundled:
+        role, basis = "mixed", "This PDF contains quotations from multiple suppliers. Download each offer separately to compare them."
+    elif buyer and not offers:
+        role, basis, evidence = "buyer", "The source documents buyer requirements.", buyer
+    elif issued_boq and (lines or summaries):
+        role, basis = "quote", "Supplier issuance and an offer heading identify a quotation in BOQ format."
+    elif requirements and offers:
+        role, basis = "mixed", "Requirements and supplier-offer signals coexist. Inspect the source."
+    elif (proposed_bom and (offers or proposed_offer)) or (proposed_offer and requirements):
+        role, basis = "mixed", "The local interpretation found conflicting document purposes. Inspect the cited sections."
+    elif lines and (requirements or proposed_bom or (estimated and not offers and not native_offer_terms - {"supplier"})):
+        role, basis = ("boq" if boq else "bom"), "Requirements or estimated-cost headings identify the purchase baseline."
+        evidence += estimated + proposed_bom
+    elif (offers or proposed_offer) and summaries and not lines:
+        role, basis = "quote", "Quotation heading and priced summary are present. The offer is not itemized."
+        evidence += summaries + proposed_offer
+    elif lines and (offers or proposed_offer) and not prices and not summaries and "supplier" not in native_offer_terms:
+        role, basis = "unknown", ("Quotation layout without offered prices or a supplier. "
+                                  "It may be a blank response form. Classify it before comparison.")
+        evidence += offers + quantities[:3] + proposed_offer
+    elif lines and (offers or proposed_offer or (prices and native_offer_terms)):
+        role, basis = "quote", "An offer heading or commercial terms accompany the material lines."
+        evidence += prices[:3] + proposed_offer
+    elif lines and quantities and not prices and not terms and not proposed_offer:
+        role, basis = "bom", "Material quantities appear without offer pricing or commercial terms."
+        evidence += quantities[:3]
+    else:
+        role, basis = "unknown", "The extracted material and commercial evidence does not establish a document type."
+        evidence += quantities[:3] + prices[:3]
+    if role in BASELINE_ROLES | {"quote", "buyer"} and (not evidence or all(a.get("weak") for a in evidence)):
+        role, basis = "unknown", "Document type relies on uncertain source readings."
+    if role in {"unknown", "mixed"}:
+        evidence += [anchor for proposal in proposals for anchor in proposal["evidence"]]
+    return {"role": role, "document_type": "boq" if boq else role,
+            "basis": basis, "evidence": evidence[:12], "version": "rules-3.0",
+            "summary_only": bool(role == "quote" and not lines and summaries), "bundled_offers": bundled}
